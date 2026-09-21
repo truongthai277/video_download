@@ -9,6 +9,13 @@ from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_from_directory, abort
 import yt_dlp
 
+# Tự động nạp FFmpeg nếu môi trường chưa có sẵn (đặc biệt hữu ích trên Render / Linux)
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+except Exception:
+    pass
+
 app = Flask(__name__)
 
 # Thư mục lưu video tải về
@@ -20,6 +27,9 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 download_tasks = {}
 tasks_lock = threading.Lock()
 task_queue = queue.Queue()
+
+_worker_thread = None
+_worker_lock = threading.Lock()
 
 
 def format_bytes(size):
@@ -61,55 +71,6 @@ def extract_urls(text):
     return urls
 
 
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-
-@app.route('/api/info', methods=['POST'])
-def get_info():
-    """Lấy thông tin video (thumbnail, title, duration) trước khi tải"""
-    data = request.get_json() or {}
-    url = data.get('url', '').strip()
-
-    if not url:
-        return jsonify({'error': 'Vui lòng cung cấp đường link (URL) hợp lệ'}), 400
-
-    ydl_opts = {
-        'skip_download': True,
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                return jsonify({'error': 'Không tìm thấy thông tin video'}), 404
-
-            title = info.get('title', 'Video không tên')
-            thumbnail = info.get('thumbnail') or (info.get('thumbnails', [{}])[-1].get('url') if info.get('thumbnails') else None)
-            duration = info.get('duration')
-            duration_str = format_seconds(duration) if duration else 'Trực tiếp / Không rõ'
-            uploader = info.get('uploader') or info.get('channel') or info.get('creator') or 'Không rõ tác giả'
-            extractor = info.get('extractor_key') or info.get('extractor') or 'Web'
-            view_count = info.get('view_count')
-            formatted_views = f"{view_count:,}" if view_count else None
-
-            return jsonify({
-                'title': title,
-                'thumbnail': thumbnail,
-                'duration': duration_str,
-                'uploader': uploader,
-                'extractor': extractor,
-                'views': formatted_views,
-                'url': url
-            })
-    except Exception as e:
-        return jsonify({'error': f'Lỗi khi phân tích video: {str(e)}'}), 400
-
-
 def run_download_task(task_id):
     """Thực thi tải 1 video cụ thể (chạy trong Queue Worker)"""
     with tasks_lock:
@@ -117,9 +78,13 @@ def run_download_task(task_id):
         if not task or task.get('status') == 'cancelled':
             return
         task['status'] = 'downloading'
+        task['progress'] = 1.0
+        task['eta'] = 'Đang phân tích...'
         task['start_time'] = time.time()
         url = task['url']
         format_type = task['format_type']
+
+    print(f"[Worker] Bat dau tai task {task_id}: {url} ({format_type})", flush=True)
 
     def progress_hook(d):
         with tasks_lock:
@@ -133,7 +98,7 @@ def run_download_task(task_id):
                 speed = d.get('speed')
                 eta = d.get('eta')
 
-                percent = (downloaded / total * 100) if total > 0 else 0
+                percent = (downloaded / total * 100) if total > 0 else 1.0
                 t['progress'] = round(percent, 1)
                 t['speed'] = f"{format_bytes(speed)}/s" if speed else ""
                 t['eta'] = format_seconds(eta) if eta else ""
@@ -154,6 +119,12 @@ def run_download_task(task_id):
         'quiet': True,
         'no_warnings': True,
         'windowsfilenames': True,
+        'socket_timeout': 30,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web', 'ios'],
+            }
+        },
     }
 
     if format_type == 'audio_mp3':
@@ -183,7 +154,6 @@ def run_download_task(task_id):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Lấy thông tin & tải
             info = ydl.extract_info(url, download=True)
 
             final_filename = None
@@ -214,7 +184,10 @@ def run_download_task(task_id):
                     t['progress'] = 100.0
                     t['filename'] = final_filename
                     t['title'] = info.get('title', 'Video đã tải')
+            print(f"[Worker] Tai hoan tat task {task_id}: {final_filename}", flush=True)
+
     except Exception as e:
+        print(f"[Worker Error task {task_id}]: {e}", flush=True)
         with tasks_lock:
             t = download_tasks.get(task_id)
             if t and t.get('status') != 'cancelled':
@@ -224,6 +197,7 @@ def run_download_task(task_id):
 
 def queue_worker():
     """Background worker xử lý hàng đợi tải tuần tự từng video một"""
+    print(f"[Queue Worker] Bat dau chay trong Process PID: {os.getpid()}", flush=True)
     while True:
         try:
             task_id = task_queue.get()
@@ -233,19 +207,86 @@ def queue_worker():
             if task and task.get('status') == 'queued':
                 run_download_task(task_id)
         except Exception as e:
-            print(f"[Queue Worker Error]: {e}")
+            print(f"[Queue Worker Exception]: {e}", flush=True)
         finally:
             task_queue.task_done()
 
 
-# Khởi động Queue Worker duy nhất
-worker_thread = threading.Thread(target=queue_worker, daemon=True)
-worker_thread.start()
+def ensure_worker_running():
+    """Đảm bảo worker thread luôn sống trong process hiện tại (khắc phục lỗi fork của Gunicorn trên Render)"""
+    global _worker_thread
+    with _worker_lock:
+        if _worker_thread is None or not _worker_thread.is_alive():
+            _worker_thread = threading.Thread(target=queue_worker, daemon=True)
+            _worker_thread.start()
+            print(f"[Queue Worker] Da kich hoat worker thread trong PID {os.getpid()}", flush=True)
+
+
+# Tự động kích hoạt worker khi có bất kỳ request nào đến server
+@app.before_request
+def before_request_hook():
+    ensure_worker_running()
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+@app.route('/api/info', methods=['POST'])
+def get_info():
+    """Lấy thông tin video (thumbnail, title, duration) trước khi tải"""
+    data = request.get_json() or {}
+    url = data.get('url', '').strip()
+
+    if not url:
+        return jsonify({'error': 'Vui lòng cung cấp đường link (URL) hợp lệ'}), 400
+
+    ydl_opts = {
+        'skip_download': True,
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'socket_timeout': 15,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web', 'ios'],
+            }
+        },
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                return jsonify({'error': 'Không tìm thấy thông tin video'}), 404
+
+            title = info.get('title', 'Video không tên')
+            thumbnail = info.get('thumbnail') or (info.get('thumbnails', [{}])[-1].get('url') if info.get('thumbnails') else None)
+            duration = info.get('duration')
+            duration_str = format_seconds(duration) if duration else 'Trực tiếp / Không rõ'
+            uploader = info.get('uploader') or info.get('channel') or info.get('creator') or 'Không rõ tác giả'
+            extractor = info.get('extractor_key') or info.get('extractor') or 'Web'
+            view_count = info.get('view_count')
+            formatted_views = f"{view_count:,}" if view_count else None
+
+            return jsonify({
+                'title': title,
+                'thumbnail': thumbnail,
+                'duration': duration_str,
+                'uploader': uploader,
+                'extractor': extractor,
+                'views': formatted_views,
+                'url': url
+            })
+    except Exception as e:
+        return jsonify({'error': f'Lỗi khi phân tích video: {str(e)}'}), 400
 
 
 @app.route('/api/queue/add', methods=['POST'])
 def add_to_queue():
     """Thêm một hoặc nhiều URL vào hàng đợi tải"""
+    ensure_worker_running()
     data = request.get_json() or {}
     raw_urls = data.get('urls')
     format_type = data.get('format_type', 'video_best')
@@ -275,13 +316,15 @@ def add_to_queue():
                 'downloaded': '0 B',
                 'total': '0 B',
                 'filename': None,
-                'title': u,  # Tạm thời đặt là URL, sẽ cập nhật khi tải
+                'title': u,
                 'error': None,
                 'created_at': time.time()
             }
             download_tasks[task_id] = task_info
             task_queue.put(task_id)
             added_tasks.append(task_info)
+
+    print(f"[Queue Add] Da them {len(added_tasks)} video vao hang doi. Tong hang doi: {task_queue.qsize()}", flush=True)
 
     return jsonify({
         'success': True,
@@ -293,10 +336,10 @@ def add_to_queue():
 @app.route('/api/queue/status', methods=['GET'])
 def get_queue_status():
     """Lấy danh sách tất cả các tác vụ trong hàng đợi và trạng thái của chúng"""
+    ensure_worker_running()
     with tasks_lock:
         tasks_list = list(download_tasks.values())
 
-    # Sắp xếp theo thời gian tạo tăng dần
     tasks_list.sort(key=lambda x: x.get('created_at', 0))
 
     summary = {
@@ -316,7 +359,6 @@ def get_queue_status():
 
 @app.route('/api/queue/cancel/<task_id>', methods=['POST'])
 def cancel_task(task_id):
-    """Hủy một tác vụ nếu nó đang chờ trong hàng đợi"""
     with tasks_lock:
         task = download_tasks.get(task_id)
         if not task:
@@ -333,7 +375,6 @@ def cancel_task(task_id):
 
 @app.route('/api/queue/clear', methods=['POST'])
 def clear_completed_tasks():
-    """Xóa các tác vụ đã hoàn thành hoặc lỗi khỏi giao diện hàng đợi"""
     with tasks_lock:
         to_delete = [
             tid for tid, t in download_tasks.items()
@@ -343,48 +384,6 @@ def clear_completed_tasks():
             del download_tasks[tid]
 
     return jsonify({'success': True, 'cleared_count': len(to_delete)})
-
-
-# Giữ endpoint đơn lẻ để tương thích ngược
-@app.route('/api/download', methods=['POST'])
-def single_download():
-    data = request.get_json() or {}
-    url = data.get('url', '').strip()
-    format_type = data.get('format_type', 'video_best')
-
-    if not url:
-        return jsonify({'error': 'Vui lòng cung cấp URL'}), 400
-
-    task_id = uuid.uuid4().hex
-    with tasks_lock:
-        task_info = {
-            'id': task_id,
-            'url': url,
-            'format_type': format_type,
-            'status': 'queued',
-            'progress': 0,
-            'speed': '',
-            'eta': '',
-            'downloaded': '0 B',
-            'total': '0 B',
-            'filename': None,
-            'title': url,
-            'error': None,
-            'created_at': time.time()
-        }
-        download_tasks[task_id] = task_info
-        task_queue.put(task_id)
-
-    return jsonify({'task_id': task_id})
-
-
-@app.route('/api/progress/<task_id>', methods=['GET'])
-def get_progress(task_id):
-    with tasks_lock:
-        task = download_tasks.get(task_id)
-    if not task:
-        return jsonify({'error': 'Không tìm thấy tác vụ'}), 404
-    return jsonify(task)
 
 
 @app.route('/api/file/<path:filename>', methods=['GET'])
@@ -446,10 +445,13 @@ def delete_file(filename):
         return jsonify({'error': str(e)}), 500
 
 
+# Khởi động worker thread khi khởi chạy
+ensure_worker_running()
+
 if __name__ == '__main__':
     print("=" * 60)
-    print("🚀 Video Downloader Web Server (Queue Mode) đang khởi động...")
-    print(f"📁 Thư mục lưu video: {DOWNLOAD_DIR}")
-    print("🌐 Truy cập tại: http://127.0.0.1:5000")
+    print("Video Downloader Web Server (Queue Mode) dang khoi dong...")
+    print(f"Thu muc luu video: {DOWNLOAD_DIR}")
+    print("Truy cap tai: http://127.0.0.1:5000")
     print("=" * 60)
     app.run(host='0.0.0.0', port=5000, debug=False)
