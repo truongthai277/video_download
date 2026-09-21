@@ -32,6 +32,18 @@ def format_bytes(size):
     return f"{size:.1f} TB"
 
 
+def format_seconds(seconds):
+    if not seconds or seconds < 0:
+        return "--:--"
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 def extract_urls(text):
     if not text:
         return []
@@ -46,7 +58,7 @@ def extract_urls(text):
 
 
 def download_media(url, format_type='video_best'):
-    """Tải video hoặc audio bằng yt-dlp"""
+    """Tải video hoặc audio bằng yt-dlp và lưu về thư mục downloads"""
     outtmpl = os.path.join(DOWNLOAD_DIR, '%(title).150s [%(id)s].%(ext)s')
     ydl_opts = {
         'outtmpl': outtmpl,
@@ -102,7 +114,7 @@ def download_media(url, format_type='video_best'):
             'filepath': final_filename,
             'title': info.get('title', 'Video'),
             'duration': info.get('duration', 0),
-            'uploader': info.get('uploader', 'Unknown'),
+            'uploader': info.get('uploader') or info.get('channel') or 'Không rõ',
             'format_type': format_type
         }
 
@@ -118,7 +130,7 @@ def process_queue(bot):
             msg_id = task.get('msg_id')
 
             bot.edit_message_text(
-                f"⏳ <b>Đang tải video...</b>\n🔗 <code>{url}</code>\nVui lòng chờ trong giây lát...",
+                f"⏳ <b>Đang tải video về máy...</b>\n🔗 <code>{url}</code>\nVui lòng chờ trong giây lát...",
                 chat_id=chat_id,
                 message_id=msg_id,
                 parse_mode='HTML'
@@ -129,65 +141,60 @@ def process_queue(bot):
 
             if not filepath or not os.path.exists(filepath):
                 bot.edit_message_text(
-                    f"❌ Không tìm thấy file sau khi tải: {url}",
+                    f"❌ <b>Không tìm thấy file sau khi tải:</b>\n<code>{url}</code>",
                     chat_id=chat_id,
-                    message_id=msg_id
+                    message_id=msg_id,
+                    parse_mode='HTML'
                 )
                 continue
 
             filesize = os.path.getsize(filepath)
             filesize_str = format_bytes(filesize)
             title = result.get('title', 'Video')
+            duration_str = format_seconds(result.get('duration', 0))
+            uploader = result.get('uploader', 'Không rõ')
+            filename = os.path.basename(filepath)
 
-            # Giới hạn dung lượng gửi qua Telegram bot thông thường là 50MB (52,428,800 bytes)
-            MAX_TELEGRAM_SIZE = 49.5 * 1024 * 1024
+            format_labels = {
+                'video_best': 'Video Chất Lượng Cao (MP4)',
+                'video_720': 'Video 720p HD (MP4)',
+                'audio_mp3': 'Âm Thanh MP3 (192kbps)'
+            }
+            fmt_display = format_labels.get(format_type, format_type)
 
-            if filesize <= MAX_TELEGRAM_SIZE:
-                bot.edit_message_text(
-                    f"📤 <b>Đang gửi file lên Telegram...</b>\n🎬 <b>{title}</b> ({filesize_str})",
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    parse_mode='HTML'
-                )
+            # Thông báo hoàn tất tải về máy (KHÔNG gửi file qua Telegram)
+            completion_message = (
+                f"✅ <b>TẢI HOÀN TẤT VỀ MÁY!</b>\n\n"
+                f"🎬 <b>Tiêu đề:</b> {title}\n"
+                f"👤 <b>Tác giả/Kênh:</b> {uploader}\n"
+                f"⏱️ <b>Thời lượng:</b> {duration_str}\n"
+                f"💾 <b>Dung lượng:</b> {filesize_str}\n"
+                f"🎯 <b>Định dạng:</b> {fmt_display}\n"
+                f"📁 <b>Tên file:</b> <code>{filename}</code>\n\n"
+                f"📂 <i>Đã lưu thành công vào thư mục <b>downloads</b> trên máy tính của bạn!</i>"
+            )
 
-                with open(filepath, 'rb') as f:
-                    if format_type == 'audio_mp3':
-                        bot.send_audio(
-                            chat_id=chat_id,
-                            audio=f,
-                            title=title,
-                            performer=result.get('uploader'),
-                            duration=result.get('duration'),
-                            caption=f"🎵 {title}\n💾 Dung lượng: {filesize_str}"
-                        )
-                    else:
-                        bot.send_video(
-                            chat_id=chat_id,
-                            video=f,
-                            caption=f"🎬 <b>{title}</b>\n💾 Dung lượng: {filesize_str}",
-                            parse_mode='HTML',
-                            supports_streaming=True
-                        )
-
-                bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            else:
-                # File vượt quá 50MB, thông báo lưu trên máy tính
-                bot.edit_message_text(
-                    f"✅ <b>Tải thành công!</b>\n\n"
-                    f"🎬 <b>Tiêu đề:</b> {title}\n"
-                    f"💾 <b>Dung lượng:</b> {filesize_str}\n"
-                    f"📁 <b>Tên file:</b> <code>{os.path.basename(filepath)}</code>\n\n"
-                    f"⚠️ <i>Do file lớn hơn 50MB (giới hạn của Telegram Bot API), file đã được lưu an toàn trong thư mục <b>downloads</b> trên máy tính của bạn!</i>",
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    parse_mode='HTML'
-                )
+            bot.edit_message_text(
+                completion_message,
+                chat_id=chat_id,
+                message_id=msg_id,
+                parse_mode='HTML'
+            )
 
         except Exception as e:
             try:
-                bot.send_message(task['chat_id'], f"❌ <b>Lỗi khi tải video:</b>\n<code>{str(e)}</code>", parse_mode='HTML')
+                bot.edit_message_text(
+                    f"❌ <b>Lỗi khi tải video:</b>\n<code>{str(e)}</code>",
+                    chat_id=task['chat_id'],
+                    message_id=task.get('msg_id'),
+                    parse_mode='HTML'
+                )
             except Exception:
-                pass
+                bot.send_message(
+                    task['chat_id'],
+                    f"❌ <b>Lỗi khi tải video:</b>\n<code>{str(e)}</code>",
+                    parse_mode='HTML'
+                )
         finally:
             bot_queue.task_done()
 
@@ -216,13 +223,9 @@ def main():
     @bot.message_handler(commands=['start', 'help'])
     def send_welcome(message):
         welcome_text = (
-            "👋 <b>Xin chào! Tôi là Bot Tải Video.</b>\n\n"
-            "Chỉ cần gửi cho tôi bất kỳ đường link video nào từ:\n"
-            "• 🔴 YouTube\n"
-            "• ⚫ TikTok (không logo)\n"
-            "• 🔵 Facebook (Reels / Watch)\n"
-            "• 🟣 Instagram (Reels / Post)\n"
-            "• ⚪ Twitter / X, SoundCloud...\n\n"
+            "👋 <b>Xin chào! Tôi là Bot Điều Khiển Tải Video Về Máy Tính.</b>\n\n"
+            "Chỉ cần gửi link video cho tôi từ điện thoại hoặc máy tính, máy tính của bạn sẽ tự động tải video và lưu vào thư mục <b>downloads</b>.\n\n"
+            "📌 <b>Hỗ trợ:</b> YouTube, TikTok, Facebook, Instagram, Twitter/X, SoundCloud...\n\n"
             "📥 <i>Bạn có thể gửi 1 link hoặc gửi nhiều link cùng lúc (mỗi dòng 1 link)!</i>"
         )
         bot.reply_to(message, welcome_text, parse_mode='HTML')
@@ -253,15 +256,15 @@ def main():
 
             bot.reply_to(
                 message,
-                f"🔗 <b>Đã nhận link:</b>\n<code>{url}</code>\n\nChọn định dạng bạn muốn tải:",
+                f"🔗 <b>Đã nhận link:</b>\n<code>{url}</code>\n\nChọn định dạng muốn tải về máy:",
                 reply_markup=markup,
                 parse_mode='HTML'
             )
         else:
-            # Nếu có nhiều link, tự động thêm tất cả vào hàng đợi tải video tốt nhất
-            status_msg = bot.reply_to(
+            # Nếu có nhiều link, tự động đưa tất cả vào hàng đợi tải
+            bot.reply_to(
                 message,
-                f"📋 <b>Đã nhận {len(urls)} link video!</b>\nĐang đưa vào hàng đợi tải lần lượt từng video...",
+                f"📋 <b>Đã nhận {len(urls)} link video!</b>\nĐang xếp vào hàng đợi tải lần lượt từng video về máy...",
                 parse_mode='HTML'
             )
             for u in urls:
@@ -285,7 +288,7 @@ def main():
             url = parts[2]
 
             bot.edit_message_text(
-                f"⏳ <b>Đã đưa vào hàng đợi tải:</b>\n🔗 <code>{url}</code>\nĐang xử lý...",
+                f"⏳ <b>Đã đưa vào hàng đợi tải:</b>\n🔗 <code>{url}</code>\nĐang chờ xử lý...",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 parse_mode='HTML'
@@ -303,6 +306,7 @@ def main():
 
     print("=" * 60)
     print("🤖 Telegram Bot đang chạy và lắng nghe tin nhắn...")
+    print("📁 Chế độ: Tải về máy và gửi thông báo hoàn tất (Không gửi file qua Telegram)")
     print("Nhấn Ctrl + C để dừng Bot.")
     print("=" * 60)
     bot.infinity_polling(timeout=20, long_polling_timeout=10)
